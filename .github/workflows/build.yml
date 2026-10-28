@@ -1,0 +1,80 @@
+name: Check and build Python app
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            platform: linux-x64
+            extension: tar.gz
+          - os: windows-2025
+            platform: windows-x64
+            extension: zip
+          - os: macos-26
+            platform: macos-arm64
+            extension: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2
+        with:
+          version: '0.13.6'
+      - run: uv sync --locked --group build
+      - run: uv run --locked python -m unittest discover -s tests
+      - run: uv run --locked python main.py --smoke-test
+      - run: uv run --locked --group build python -m PyInstaller --noconfirm --clean --onedir --name LittleSignals main.py
+      - name: Smoke test packaged executable
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            ./dist/LittleSignals/LittleSignals.exe --smoke-test
+          else
+            ./dist/LittleSignals/LittleSignals --smoke-test
+          fi
+      - run: uv run --locked python scripts/archive.py ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bundle-${{ matrix.platform }}
+          path: packages/little-signals-${{ matrix.platform }}.${{ matrix.extension }}
+          if-no-files-found: error
+  release:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref_type == 'tag')
+    needs: build
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bundle-*
+          path: downloaded
+      - run: python3 scripts/collect_release.py
+      - name: Upload release package preview
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-preview
+          path: release/
+          if-no-files-found: error
+      - name: Create GitHub release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'Release tags must look like v1.2.3' >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" release/* --verify-tag --generate-notes
